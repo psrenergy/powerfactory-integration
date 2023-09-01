@@ -4,6 +4,7 @@ import os
 import psr.graf
 import powerfactory
 
+
 _HAS_PANDAS = False
 try:
     import pandas as pd
@@ -30,6 +31,8 @@ _PLANT_TYPE_OUTPUT_MAP = {
     "csp": "cspgen",
     "injection": "powinj",
 }
+
+_DURATION_FILE = "duraci"
 
 _ELM_CLASS_ATTRIBUTE_MAP = {
     "ElmSym": "pgini",
@@ -145,26 +148,31 @@ def _get_required_plant_types(plant_map: dict):
     return types
 
 
+def _load_graf_data(base_file_path: str, encoding: str):
+    extensions_to_try = ".csv", ".hdr", ".dat"
+    for ext in extensions_to_try:
+        file_path = base_file_path + ext
+        if os.path.exists(file_path):
+            if _HAS_PANDAS:
+                return psr.graf.load_as_dataframe(
+                    file_path, encoding=encoding)
+            else:
+                ReaderClass = psr.graf.CsvReader if ext == ".csv" else \
+                    psr.graf.BinReader
+                obj = ReaderClass()
+                obj.open(file_path, encoding=encoding)
+                return obj
+    return None
+
+
 def _load_plant_types_generation(sddp_case_path: str, plant_types: set,
                                  encoding: str):
     generation_df = {}
     for plant_type in plant_types:
         base_file_name = os.path.join(sddp_case_path,
                                       _PLANT_TYPE_OUTPUT_MAP[plant_type])
-        extensions_to_try = ".csv", ".hdr", ".dat"
-        for ext in extensions_to_try:
-            file_path = base_file_name + ext
-            if os.path.exists(file_path):
-                if _HAS_PANDAS:
-                    generation_df[plant_type] = psr.graf.load_as_dataframe(
-                        file_path, encoding=encoding)
-                else:
-                    ReaderClass = psr.graf.CsvReader if ext == ".csv" else \
-                        psr.graf.BinReader
-                    obj = ReaderClass()
-                    obj.open(file_path, encoding=encoding)
-                    generation_df[plant_type] = obj
-                break
+        generation_df[plant_type] = _load_graf_data(base_file_name,
+                                                    encoding=encoding)
     return generation_df
 
 
@@ -208,6 +216,13 @@ def main():
     scenario_names = _read_scenario_map(scenario_names_path)
 
     if _DEBUG_PRINT:
+        print("Reading durations")
+
+    durations_df = _load_graf_data(os.path.join(sddp_case_path,
+                                                _DURATION_FILE),
+                                   encoding=encoding)
+
+    if _DEBUG_PRINT:
         print("Reading plant -> elm map")
     plant_map_path = "plant_elm_map.csv"
     plant_map = _read_plant_map(plant_map_path)
@@ -244,6 +259,17 @@ def main():
         app.PrintInfo("Creating scenario: " + scenario_name)
         scenario_obj[0].Activate()
 
+        if _HAS_PANDAS:
+            scn_tuple = scenario.stage, scenario.block
+            scenario_duration_h = durations_df.loc[scenario.as_tuple(),
+                                                   :][0][0]
+        else:
+            agents = durations_df.agents
+            fixed_scenario = 1
+            all_values = durations_df.read(scenario.stage, fixed_scenario,
+                                           scenario.block)
+            scenario_duration_h = all_values[0]
+        units_conversion = 1000.0 / scenario_duration_h
         for elm_name, elm in pf_generators.items():
             if _DEBUG_PRINT:
                 print("Setting generator", elm_name)
@@ -271,12 +297,15 @@ def main():
                 plant_name = plant.name
                 gen_type_df = generation_df[plant_type]
                 if _HAS_PANDAS:
-                    sddp_value = gen_type_df.loc[scenario.as_tuple(), plant_name]
+                    sddp_value = gen_type_df.loc[scenario.as_tuple(),
+                                                 plant_name][0][0]
                 else:
                     agents = gen_type_df.agents
-                    all_values = gen_type_df.read(scenario.stage, scenario.scenario, scenario.block)
+                    all_values = gen_type_df.read(scenario.stage,
+                                                  scenario.scenario,
+                                                  scenario.block)
                     sddp_value = all_values[agents.index(plant_name)]
-                value = sddp_value * weight * attr_factor
+                value = sddp_value * units_conversion * weight * attr_factor
                 if _DEBUG_PRINT:
                     print("Value read:", sddp_value, "Value assigned:", value)
                 setattr(elm[0], attr_name, value)
