@@ -1,10 +1,13 @@
 import argparse
 import csv
+import logging
 import os
-import psr.factory
-import powerfactory
+import sys
+from dataclasses import dataclass
 
-_DEBUG_PRINT = False
+import psr.factory
+
+logger = logging.getLogger("sddp_plant_dispatch")
 
 
 _PLANT_TYPE_OUTPUT_MAP = {
@@ -17,6 +20,10 @@ _PLANT_TYPE_OUTPUT_MAP = {
 }
 
 _DURATION_FILE = "duraci"
+
+_SCENARIO_MAP_FILE = "scenario_names.csv"
+
+_PLANT_MAP_FILE = "plant_elm_map.csv"
 
 _ELM_CLASS_ATTRIBUTE_MAP = {
     "ElmSym": "pgini",
@@ -32,109 +39,123 @@ _ELM_CLASS_ATTRIBUTE_FACTOR_MAP = {
     "ElmAsm": 1.0,  # MW
     "ElmGenstat": 1.0,  # MW
     "ElmAsmsc": 1.0,  # MW
-    "ElmPvsys": 0.001,  # kV
+    "ElmPvsys": 0.001,  # TODO: confirm pgini unit for ElmPvsys
     "ElmXnet": 1.0,  # MW
 }
 
 
-class PlantMapEntry:
-    def __init__(self):
-        self.plant = SddpPlant()
-        self.weight = 0.0
-        self.elm_name = ""
+class DispatchError(Exception):
+    pass
 
 
+@dataclass(frozen=True)
 class SddpPlant:
-    def __init__(self):
-        self.system = ""
-        self.name = ""
-        self.type = ""
-
-    def __hash__(self):
-        return hash("{},{},{}".format(self.system, self.name, self.type))
-
-    def __eq__(self, other):
-        return hash(self) == hash(other)
+    system: str
+    type: str
+    name: str
 
 
+@dataclass(frozen=True)
 class SddpScenario:
-    def __init__(self):
-        self.stage = 0
-        self.scenario = 0
-        self.block = 0
-
-    def __hash__(self):
-        return hash("{},{},{}".format(self.stage, self.scenario, self.block))
-
-    def __eq__(self, other):
-        return hash(self) == hash(other)
+    stage: int
+    scenario: int
+    block: int
 
     def as_tuple(self):
         return self.stage, self.scenario, self.block
 
 
-def create_scenario(app, scenario_name: str):
-    app.PrintInfo("Creating scenario: " + scenario_name)
-    scen_folder = app.GetProjectFolder('scen')
-    scenario = scen_folder.CreateObject("IntScenario", scenario_name)
-    return scenario
+@dataclass
+class PlantMapEntry:
+    plant: SddpPlant
+    weight: float
+    elm_name: str
+
+
+class _PowerFactoryLogHandler(logging.Handler):
+    """Forwards log records to PowerFactory's output window."""
+    def __init__(self, app):
+        super().__init__(logging.INFO)
+        self.app = app
+
+    def emit(self, record):
+        message = self.format(record)
+        if record.levelno >= logging.ERROR:
+            self.app.PrintError(message)
+        elif record.levelno >= logging.WARNING:
+            self.app.PrintWarn(message)
+        else:
+            self.app.PrintInfo(message)
+
+
+def _open_csv(file_path: str):
+    if not os.path.exists(file_path):
+        raise DispatchError("Input file not found: " + file_path)
+    return open(file_path, "r", encoding="utf-8-sig", newline="")
 
 
 def _read_plant_map(plant_map_file_path: str):
     entries = {}
-    with open(plant_map_file_path, "r") as csv_file:
+    with _open_csv(plant_map_file_path) as csv_file:
         reader = csv.reader(csv_file)
         next(reader)
-        for row in reader:
-            sddp_plant = SddpPlant()
-            sddp_plant.system = row[0].strip().lower()
-            sddp_plant.type = row[1].strip().lower()
-            sddp_plant.name = row[2].strip()
-            entry = PlantMapEntry()
-            entry.plant = sddp_plant
-            entry.weight = float(row[3])
-            entry.elm_name = row[4].strip()
-
-            if sddp_plant not in entries.keys():
-                entries[sddp_plant] = [entry, ]
-            else:
-                entries[sddp_plant].append(entry)
+        for line, row in enumerate(reader, start=2):
+            if not row:
+                continue
+            plant_type = row[1].strip().lower()
+            if plant_type not in _PLANT_TYPE_OUTPUT_MAP:
+                raise DispatchError(
+                    "{}:{}: unknown plant type '{}'. Supported types: {}"
+                    .format(plant_map_file_path, line, plant_type,
+                            ", ".join(_PLANT_TYPE_OUTPUT_MAP)))
+            sddp_plant = SddpPlant(system=row[0].strip().lower(),
+                                   type=plant_type,
+                                   name=row[2].strip())
+            entry = PlantMapEntry(plant=sddp_plant, weight=float(row[3]),
+                                  elm_name=row[4].strip())
+            entries.setdefault(sddp_plant, []).append(entry)
     return entries
 
 
 def _read_scenario_map(scenario_map_file_path: str):
     entries = {}
-    with open(scenario_map_file_path, "r") as csv_file:
+    with _open_csv(scenario_map_file_path) as csv_file:
         reader = csv.reader(csv_file)
         next(reader)
         for row in reader:
-            sddp_scenario = SddpScenario()
-            sddp_scenario.stage = int(row[0])
-            sddp_scenario.scenario = int(row[1])
-            sddp_scenario.block = int(row[2])
-            name = row[3].strip()
-            entries[sddp_scenario] = name
+            if not row:
+                continue
+            sddp_scenario = SddpScenario(stage=int(row[0]),
+                                         scenario=int(row[1]),
+                                         block=int(row[2]))
+            entries[sddp_scenario] = row[3].strip()
     return entries
 
 
 def _redistribute_weights(plant_map: dict):
-    for plant in plant_map.keys():
-        entries = plant_map[plant]
-        total_weight = sum([entry.weight for entry in entries])
+    for plant, entries in plant_map.items():
+        total_weight = sum(entry.weight for entry in entries)
+        if total_weight <= 0.0:
+            raise DispatchError(
+                "Total weight of plant '{}' ({}, system '{}') must be "
+                "positive.".format(plant.name, plant.type, plant.system))
         for entry in entries:
             entry.weight /= total_weight
 
 
-def _get_required_plant_types(plant_map: dict):
-    types = set()
-    for plant in plant_map.keys():
-        types.add(plant.type)
-    return types
+def _build_elm_map(plant_map: dict):
+    """Maps PowerFactory element names to the plant entries feeding them."""
+    elm_map = {}
+    for entries in plant_map.values():
+        for entry in entries:
+            elm_map.setdefault(entry.elm_name, []).append(entry)
+    return elm_map
 
 
 class SddpResult:
     """SDDP result file values indexed by (stage, scenario, block)."""
-    def __init__(self, df):
+    def __init__(self, df, file_path: str):
+        self.file_path = file_path
         index_names = df.index_names
         block_column = "block" if "block" in index_names else "hour"
         stages = df["stage"]
@@ -153,8 +174,15 @@ class SddpResult:
         if not self.has_scenarios:
             scenario_number = 1
         column = self.agents[0] if agent is None else agent
-        return float(self.columns[column][
-            self.rows[(stage, scenario_number, block)]])
+        if column not in self.columns:
+            raise DispatchError("Agent '{}' not found in {}".format(
+                column, self.file_path))
+        key = (stage, scenario_number, block)
+        if key not in self.rows:
+            raise DispatchError(
+                "Stage {}, scenario {}, block {} not found in {}".format(
+                    *key, self.file_path))
+        return float(self.columns[column][self.rows[key]])
 
 
 def _load_sddp_result(base_file_path: str):
@@ -164,8 +192,8 @@ def _load_sddp_result(base_file_path: str):
         if os.path.exists(file_path):
             df = psr.factory.load_dataframe(
                 file_path, options={"IndexFormat": "stage"})
-            return SddpResult(df)
-    raise FileNotFoundError("SDDP result file not found: " + base_file_path)
+            return SddpResult(df, file_path)
+    raise DispatchError("SDDP result file not found: " + base_file_path)
 
 
 def _load_plant_types_generation(sddp_case_path: str, plant_types: set):
@@ -177,126 +205,172 @@ def _load_plant_types_generation(sddp_case_path: str, plant_types: set):
     return generation_df
 
 
-def _get_required_powerfactory_generators_names(plant_map: dict):
-    generators = set()
-    for plant in plant_map.keys():
-        entries = plant_map[plant]
-        for entry in entries:
-            generators.add(entry.elm_name)
-    return generators
+def _get_powerfactory_elements(app, names):
+    elements = {}
+    for name in sorted(names):
+        objs = app.GetCalcRelevantObjects(name)
+        if not objs:
+            logger.warning("PowerFactory element not found: %s", name)
+            continue
+        if len(objs) > 1:
+            logger.warning("Multiple PowerFactory elements match %s; "
+                           "all of them will be set.", name)
+        supported = []
+        for obj in objs:
+            elm_class = obj.GetClassName()
+            if elm_class in _ELM_CLASS_ATTRIBUTE_MAP:
+                supported.append(obj)
+            else:
+                logger.warning("Unsupported element class %s for %s; "
+                               "skipping.", elm_class, name)
+        if supported:
+            elements[name] = supported
+    return elements
 
 
-def _get_powerfactory_objects_by_full_name(app, names: set):
-    objects = {}
-    for name in names:
-        obj = app.GetCalcRelevantObjects(name)
-        if obj is not None and len(obj) > 0:
-            objects[name] = obj
-    return objects
+def _get_or_create_scenario(app, scenario_name: str):
+    scen_folder = app.GetProjectFolder("scen")
+    existing = scen_folder.GetContents(scenario_name + ".IntScenario")
+    if existing:
+        logger.info("Updating existing scenario: %s", scenario_name)
+        return existing[0]
+    logger.info("Creating scenario: %s", scenario_name)
+    return scen_folder.CreateObject("IntScenario", scenario_name)
+
+
+def _compute_elements_power(scenario, scenario_name, durations,
+                            generation_df, elm_map, elm_names):
+    """Returns the power in MW of each element for a SDDP scenario."""
+    duration_h = durations.value(scenario)
+    if duration_h <= 0.0:
+        raise DispatchError("Non-positive block duration for scenario "
+                            + scenario_name)
+    # SDDP generation in GWh per block -> MW
+    units_conversion = 1000.0 / duration_h
+
+    elements_power = {}
+    for elm_name in elm_names:
+        power_mw = 0.0
+        for entry in elm_map[elm_name]:
+            plant = entry.plant
+            sddp_value = generation_df[plant.type].value(scenario, plant.name)
+            power_mw += sddp_value * units_conversion * entry.weight
+        elements_power[elm_name] = power_mw
+    return elements_power
+
+
+def _print_dry_run(scenario_names, durations, generation_df, elm_map):
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(["Scenario Name", "Element", "Power (MW)"])
+    for scenario, scenario_name in scenario_names.items():
+        elements_power = _compute_elements_power(
+            scenario, scenario_name, durations, generation_df, elm_map,
+            sorted(elm_map.keys()))
+        for elm_name, power_mw in elements_power.items():
+            writer.writerow([scenario_name, elm_name,
+                             "{:.6f}".format(power_mw)])
+
+
+def _apply_scenario(app, scenario, scenario_name, durations, generation_df,
+                    elm_map, pf_elements):
+    scenario_obj = _get_or_create_scenario(app, scenario_name)
+    scenario_obj.Activate()
+
+    elements_power = _compute_elements_power(
+        scenario, scenario_name, durations, generation_df, elm_map,
+        pf_elements.keys())
+    for elm_name, objs in pf_elements.items():
+        power_mw = elements_power[elm_name]
+        for obj in objs:
+            elm_class = obj.GetClassName()
+            value = power_mw * _ELM_CLASS_ATTRIBUTE_FACTOR_MAP[elm_class]
+            logger.debug("%s: %s = %f", elm_name,
+                         _ELM_CLASS_ATTRIBUTE_MAP[elm_class], value)
+            setattr(obj, _ELM_CLASS_ATTRIBUTE_MAP[elm_class], value)
+
+    save_scenario = 1
+    scenario_obj.Deactivate(save_scenario)
+    logger.info("Scenario saved: %s", scenario_name)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Distribute SDDP plant generation in PowerFactory "
+                    "generators, one operation scenario per SDDP "
+                    "stage/scenario/block.")
+    parser.add_argument("-p", "--project", help="PowerFactory project name",
+                        default="Transmission Example")
+    parser.add_argument("-sp", "--path", help="SDDP case path", default=".")
+    parser.add_argument("--scenarios",
+                        help="Scenario names CSV file (default: {} in the "
+                             "SDDP case path)".format(_SCENARIO_MAP_FILE))
+    parser.add_argument("--plant-map",
+                        help="Plant/element map CSV file (default: {} in the "
+                             "SDDP case path)".format(_PLANT_MAP_FILE))
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Print the power of each element per scenario "
+                             "as CSV without connecting to PowerFactory")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Print debug messages")
+    return parser.parse_args()
 
 
 def main():
-    # parse arguments
-    # accepts an argument with the PF project name
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--project", help="PowerFactory project name",
-                        default="Transmission Example")
-    # Sddp case path
-    parser.add_argument("-sp", "--path", help="SDDP case path",
-                        default=".")
-    args = parser.parse_args()
+    args = _parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s: %(message)s")
 
-    pf_project_name = args.project
     sddp_case_path = args.path
-    scenario_names_path = "scenarios_names.csv"
-    if _DEBUG_PRINT:
-        print("Reading scenarios_names")
-    scenario_names = _read_scenario_map(scenario_names_path)
+    scenario_map_path = args.scenarios or os.path.join(sddp_case_path,
+                                                       _SCENARIO_MAP_FILE)
+    plant_map_path = args.plant_map or os.path.join(sddp_case_path,
+                                                    _PLANT_MAP_FILE)
 
-    if _DEBUG_PRINT:
-        print("Reading durations")
-
-    durations_df = _load_sddp_result(os.path.join(sddp_case_path,
-                                                _DURATION_FILE))
-
-    if _DEBUG_PRINT:
-        print("Reading plant -> elm map")
-    plant_map_path = "plant_elm_map.csv"
+    logger.debug("Reading %s", scenario_map_path)
+    scenario_names = _read_scenario_map(scenario_map_path)
+    logger.debug("Reading %s", plant_map_path)
     plant_map = _read_plant_map(plant_map_path)
     _redistribute_weights(plant_map)
-    plant_types = _get_required_plant_types(plant_map)
+    elm_map = _build_elm_map(plant_map)
+
+    durations = _load_sddp_result(os.path.join(sddp_case_path,
+                                               _DURATION_FILE))
+    plant_types = {plant.type for plant in plant_map}
     generation_df = _load_plant_types_generation(sddp_case_path, plant_types)
 
-    pf_generator_names = _get_required_powerfactory_generators_names(plant_map)
+    if args.dry_run:
+        _print_dry_run(scenario_names, durations, generation_df, elm_map)
+        return
 
-    if _DEBUG_PRINT:
-        print("Starting powerfactory")
+    # Imported here so dry runs work without PowerFactory
+    import powerfactory
     app = powerfactory.GetApplication()
+    if app is None:
+        raise DispatchError("Could not connect to PowerFactory.")
     app.ClearOutputWindow()
-    app.PrintInfo("Starting")
-    if _DEBUG_PRINT:
-        print("Activating project", pf_project_name)
-    app.ActivateProject(pf_project_name)
+    pf_handler = _PowerFactoryLogHandler(app)
+    pf_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(pf_handler)
 
-    if _DEBUG_PRINT:
-        print("Loading PF generators")
-    pf_generators = _get_powerfactory_objects_by_full_name(app,
-                                                           pf_generator_names)
-    if _DEBUG_PRINT:
-        print("Loaded generators")
-        print(pf_generators)
-        print("Loaded Scenarios")
-        print(scenario_names)
+    logger.info("Activating project: %s", args.project)
+    if app.ActivateProject(args.project) != 0:
+        raise DispatchError("Could not activate PowerFactory project: "
+                            + args.project)
+
+    pf_elements = _get_powerfactory_elements(app, elm_map.keys())
+    if not pf_elements:
+        raise DispatchError("None of the mapped PowerFactory elements "
+                            "were found.")
+
     for scenario, scenario_name in scenario_names.items():
-        # Create scenario
-        scenario_obj = create_scenario(app, scenario_name)
-        if _DEBUG_PRINT:
-            print("Creating scenario", scenario_name)
-        app.PrintInfo("Creating scenario: " + scenario_name)
-        scenario_obj[0].Activate()
-
-        scenario_duration_h = durations_df.value(scenario)
-        units_conversion = 1000.0 / scenario_duration_h
-        for elm_name, elm in pf_generators.items():
-            if _DEBUG_PRINT:
-                print("Setting generator", elm_name)
-            elm_class = elm[0].GetClassName()
-            attr_name = _ELM_CLASS_ATTRIBUTE_MAP[elm_class]
-            attr_factor = _ELM_CLASS_ATTRIBUTE_FACTOR_MAP[elm_class]
-            # search for related plant in plant map
-            # TODO: maybe an inverse map is better
-            plant = None
-            weight = 1.0
-            for sddp_plant, plant_map_entries in plant_map.items():
-                for entry in plant_map_entries:
-                    if elm_name == entry.elm_name:
-                        plant = sddp_plant
-                        weight = entry.weight
-                        break
-                if plant is not None:
-                    break
-            if plant is None:
-                app.PrintInfo("Plant not found for generator: " + elm_name)
-            else:
-                if _DEBUG_PRINT:
-                    print("Plant found:", plant.system, plant.type, plant.name)
-                plant_type = plant.type
-                plant_name = plant.name
-                gen_type_df = generation_df[plant_type]
-                sddp_value = gen_type_df.value(scenario, plant_name)
-                value = sddp_value * units_conversion * weight * attr_factor
-                if _DEBUG_PRINT:
-                    print("Value read:", sddp_value, "Value assigned:", value)
-                setattr(elm[0], attr_name, value)
-
-        save_scenario = 1
-        scenario_obj[0].Deactivate(save_scenario)
-        if _DEBUG_PRINT:
-            print("Scenario created", scenario_name)
-        app.PrintInfo("Scenario created: " + scenario_name)
-    print("Finished")
-    app.PrintInfo("Finished")
+        _apply_scenario(app, scenario, scenario_name, durations,
+                        generation_df, elm_map, pf_elements)
+    logger.info("Finished")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DispatchError as e:
+        logger.error(str(e))
+        sys.exit(1)

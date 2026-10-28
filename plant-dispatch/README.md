@@ -12,6 +12,21 @@ This script distribute Sddp plant's generation in PowerFactory generators.
     - requires a valid PSR license
 
 
+### Making `powerfactory` importable
+
+The `powerfactory` module ships with PowerFactory and can't be installed with
+`pip`. Add the PowerFactory Python folder that matches your Python version to
+`PYTHONPATH` before running the script, for example:
+
+```bat
+set PYTHONPATH=C:\Program Files\DIgSILENT\PowerFactory 2024\Python\3.10;%PYTHONPATH%
+```
+
+Adjust the PowerFactory version and Python version in the path to your
+installation. The PowerFactory and Python versions must be compatible (both
+64-bit, and a Python version supported by your PowerFactory release).
+
+
 ## Usage
 
 1. Run Sddp with appropriate result files enabled
@@ -23,11 +38,29 @@ This script distribute Sddp plant's generation in PowerFactory generators.
     - Power injection output
 2. [Create a CSV file mapping Sddp scenarios to PowerFactory scenarios](#scenario-names)
 3. [Create a CSV file mapping Sddp plants to PowerFactory generator elements](#sddp-plantpowerfactory-elm-mapping)
-4. Run [](sddp_plant_dispatch.py) script:
+4. Run the [sddp_plant_dispatch.py](sddp_plant_dispatch.py) script:
 
 ```bat
 python sddp_plant_dispatch.py -p "Project Name" --path "C:\temp\sddp_case"
 ```
+
+By default, the input CSV files are read from the SDDP case path. Use
+`--scenarios` and `--plant-map` to point to files elsewhere, and `-v` to print
+debug messages.
+
+Scenarios that already exist in the PowerFactory project are updated instead
+of duplicated.
+
+To check the values before changing the PowerFactory project, run with
+`--dry-run`. It prints the power in MW assigned to each element in each
+scenario as CSV, without connecting to PowerFactory:
+
+```bat
+python sddp_plant_dispatch.py --path "C:\temp\sddp_case" --dry-run > dispatch.csv
+```
+
+The [examples](./examples) folder has sample `scenario_names.csv` and
+`plant_elm_map.csv` files.
 
 
 ### Input files
@@ -42,7 +75,8 @@ The following input files are required to run the script:
 
 #### Scenario names
 
-Maps a Sddp scenario to a PowerFactory scenario name.
+Maps a Sddp scenario to a PowerFactory scenario name. The file name is
+`scenario_names.csv` and its first line is a header.
 
 |     Column      | Description                 |
 |:---------------:|:----------------------------|
@@ -59,7 +93,12 @@ It's possible to distribute Sddp Plants' generation in multiple PowerFactory gen
 ![Plant mapping](./docs/plant_map.png)
 
 
-The file name is `plant_elm_map.csv` and its column names are:
+Weights of a plant are normalized, so they don't need to add up to 1. A
+PowerFactory element may receive generation from more than one Sddp plant; the
+contributions are summed.
+
+The file name is `plant_elm_map.csv`, its first line is a header and its
+columns are:
 
 |   Column   | Description                                                          |
 |:----------:|:---------------------------------------------------------------------|
@@ -74,7 +113,7 @@ Supported plant types:
 
 | Plant Type | Description                    |
 |:----------:|:-------------------------------|
-|   hidro    | Hydro plant                    |
+|   hydro    | Hydro plant                    |
 |  thermal   | Thermal plant                  |
 | renewable  | Renewable plant                |
 |  battery   | Battery                        |
