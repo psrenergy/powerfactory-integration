@@ -6,10 +6,10 @@ This script distribute Sddp plant's generation in PowerFactory generators.
 ## Requirements
 
 - PowerFactory 15 or newer
-- Python 3.3 or newer
-  - [psr-graf](https://github.com/psrenergy/pygraf)
-    - `pip install psr-graf`
-  - optional: pandas and numpy
+- Python 3.10 or newer
+  - [psr-factory](https://docs.psr-inc.com/factory/)
+    - `pip install psr-factory`
+    - requires a valid PSR license
 
 
 ## Usage

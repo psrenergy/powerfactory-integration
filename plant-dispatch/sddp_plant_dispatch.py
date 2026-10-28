@@ -1,24 +1,8 @@
 import argparse
 import csv
 import os
-import psr.graf
+import psr.factory
 import powerfactory
-
-
-_HAS_PANDAS = False
-try:
-    import pandas as pd
-    _HAS_PANDAS = True
-except ImportError:
-    pd = None
-
-_HAS_GRAF = False
-try:
-    import psr.graf
-    _HAS_GRAF = True
-except ImportError:
-    psr = None
-    pass
 
 _DEBUG_PRINT = False
 
@@ -148,31 +132,48 @@ def _get_required_plant_types(plant_map: dict):
     return types
 
 
-def _load_graf_data(base_file_path: str, encoding: str):
-    extensions_to_try = ".csv", ".hdr", ".dat"
+class SddpResult:
+    """SDDP result file values indexed by (stage, scenario, block)."""
+    def __init__(self, df):
+        index_names = df.index_names
+        block_column = "block" if "block" in index_names else "hour"
+        stages = df["stage"]
+        blocks = df[block_column]
+        # Files with a single scenario have no scenario index column
+        self.has_scenarios = "scenario" in index_names
+        scenarios = df["scenario"] if self.has_scenarios else [1] * len(df)
+        self.rows = {}
+        for row, key in enumerate(zip(stages, scenarios, blocks)):
+            self.rows[tuple(int(k) for k in key)] = row
+        self.agents = list(df.column_names)
+        self.columns = {agent: df[agent] for agent in self.agents}
+
+    def value(self, scenario, agent=None):
+        stage, scenario_number, block = scenario.as_tuple()
+        if not self.has_scenarios:
+            scenario_number = 1
+        column = self.agents[0] if agent is None else agent
+        return float(self.columns[column][
+            self.rows[(stage, scenario_number, block)]])
+
+
+def _load_sddp_result(base_file_path: str):
+    extensions_to_try = ".csv", ".hdr"
     for ext in extensions_to_try:
         file_path = base_file_path + ext
         if os.path.exists(file_path):
-            if _HAS_PANDAS:
-                return psr.graf.load_as_dataframe(
-                    file_path, encoding=encoding)
-            else:
-                ReaderClass = psr.graf.CsvReader if ext == ".csv" else \
-                    psr.graf.BinReader
-                obj = ReaderClass()
-                obj.open(file_path, encoding=encoding)
-                return obj
-    return None
+            df = psr.factory.load_dataframe(
+                file_path, options={"IndexFormat": "stage"})
+            return SddpResult(df)
+    raise FileNotFoundError("SDDP result file not found: " + base_file_path)
 
 
-def _load_plant_types_generation(sddp_case_path: str, plant_types: set,
-                                 encoding: str):
+def _load_plant_types_generation(sddp_case_path: str, plant_types: set):
     generation_df = {}
     for plant_type in plant_types:
         base_file_name = os.path.join(sddp_case_path,
                                       _PLANT_TYPE_OUTPUT_MAP[plant_type])
-        generation_df[plant_type] = _load_graf_data(base_file_name,
-                                                    encoding=encoding)
+        generation_df[plant_type] = _load_sddp_result(base_file_name)
     return generation_df
 
 
@@ -200,15 +201,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--project", help="PowerFactory project name",
                         default="Transmission Example")
-    parser.add_argument("-e", "--encoding", help="Result files encoding",
-                        default="utf-8")
     # Sddp case path
     parser.add_argument("-sp", "--path", help="SDDP case path",
                         default=".")
     args = parser.parse_args()
 
     pf_project_name = args.project
-    encoding = args.encoding
     sddp_case_path = args.path
     scenario_names_path = "scenarios_names.csv"
     if _DEBUG_PRINT:
@@ -218,9 +216,8 @@ def main():
     if _DEBUG_PRINT:
         print("Reading durations")
 
-    durations_df = _load_graf_data(os.path.join(sddp_case_path,
-                                                _DURATION_FILE),
-                                   encoding=encoding)
+    durations_df = _load_sddp_result(os.path.join(sddp_case_path,
+                                                _DURATION_FILE))
 
     if _DEBUG_PRINT:
         print("Reading plant -> elm map")
@@ -228,8 +225,7 @@ def main():
     plant_map = _read_plant_map(plant_map_path)
     _redistribute_weights(plant_map)
     plant_types = _get_required_plant_types(plant_map)
-    generation_df = _load_plant_types_generation(sddp_case_path, plant_types,
-                                                 encoding=encoding)
+    generation_df = _load_plant_types_generation(sddp_case_path, plant_types)
 
     pf_generator_names = _get_required_powerfactory_generators_names(plant_map)
 
@@ -259,16 +255,7 @@ def main():
         app.PrintInfo("Creating scenario: " + scenario_name)
         scenario_obj[0].Activate()
 
-        if _HAS_PANDAS:
-            scn_tuple = scenario.stage, scenario.block
-            scenario_duration_h = durations_df.loc[scenario.as_tuple(),
-                                                   :][0][0]
-        else:
-            agents = durations_df.agents
-            fixed_scenario = 1
-            all_values = durations_df.read(scenario.stage, fixed_scenario,
-                                           scenario.block)
-            scenario_duration_h = all_values[0]
+        scenario_duration_h = durations_df.value(scenario)
         units_conversion = 1000.0 / scenario_duration_h
         for elm_name, elm in pf_generators.items():
             if _DEBUG_PRINT:
@@ -296,15 +283,7 @@ def main():
                 plant_type = plant.type
                 plant_name = plant.name
                 gen_type_df = generation_df[plant_type]
-                if _HAS_PANDAS:
-                    sddp_value = gen_type_df.loc[scenario.as_tuple(),
-                                                 plant_name][0][0]
-                else:
-                    agents = gen_type_df.agents
-                    all_values = gen_type_df.read(scenario.stage,
-                                                  scenario.scenario,
-                                                  scenario.block)
-                    sddp_value = all_values[agents.index(plant_name)]
+                sddp_value = gen_type_df.value(scenario, plant_name)
                 value = sddp_value * units_conversion * weight * attr_factor
                 if _DEBUG_PRINT:
                     print("Value read:", sddp_value, "Value assigned:", value)
